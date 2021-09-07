@@ -1,0 +1,14 @@
+#! /usr/bin/env perl
+use strict;
+use warnings;
+my %suspended;
+
+open my $ud, '<', '/etc/userdatadomains' or die "Unable to open /etc/userdatadomains for reading : $!";
+while (defined(my $line = <$ud>)) {
+        chomp $line;
+        my ($domain, $data) = split /: /, $line, 2;
+        my ($user, undef, undef, undef, $path) = split /==/, $data;
+        $suspended{$user} = (-f "/var/cpanel/suspended/$user" ? 'suspended' : '') unless exists $suspended{$user};
+        print "$user:$suspended{$user}:$domain:$path\n";
+}
+close $ud;

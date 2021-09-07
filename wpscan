@@ -1,4 +1,4 @@
-#! /usr/local/cpanel/3rdparty/bin/perl
+#! /usr/bin/env perl
 use Sys::Hostname;
 use DBI;
 use Fcntl qw(:flock);
@@ -15,17 +15,16 @@ my $dbdir = "/var/lib/wp";
 open my $runonce, '<', $0 or die "Unable to open self for reading $0 : $!";
 flock $runonce, LOCK_EX | LOCK_NB or exit;
 
-sub userdatascan {
-        open my $ud, '<', '/etc/userdatadomains' or die "Unable to open /etc/userdatadomains for reading : $!";
-        while (defined(my $line = <$ud>)) {
+sub docrootinfo {
+        open my $p, '-|', 'docrootinfo' or die "Unable to call 'docrootinfo' : $!";
+        while (defined(my $line = <$p>)) {
                 chomp $line;
-                my ($domain, $data) = split /: /, $line, 2;
-                my ($user, undef, undef, undef, $path) = split /==/, $data;
-                $suspended{$user} = (-f "/var/cpanel/suspended/$user" ? 1 : 0) unless exists $suspended{$user};
+                my ($user, $suspended, $domain, $path) = split /:/, $line, 4;
+                $suspended{$user} = ($suspended eq 'suspended' ? 1 : 0);
                 $domain2user{lc $domain} = $user;
                 $domain2path{lc $domain} = $path;
         }
-        close $ud;
+        close $p;
 }
 
 sub confighasdb {
@@ -175,6 +174,6 @@ SQL
 }
 
 open STDERR, '>', '/dev/null' unless -t \*STDIN;
-userdatascan();
+docrootinfo();
 wpscan(@$_) for tables();
 update_sqlite();
