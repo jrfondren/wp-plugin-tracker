@@ -1,0 +1,180 @@
+#! /usr/local/cpanel/3rdparty/bin/perl
+use Sys::Hostname;
+use DBI;
+use Fcntl qw(:flock);
+use YAML qw(LoadFile);
+use strict;
+use warnings;
+my $hostname = hostname;
+my %wp; # db => tbl => user => docroot => wp_version => theme => plugin_path => plugin_version
+my %domain2path;
+my %domain2user;
+my %suspended;
+my $dbfile = "/var/lib/wp/plugins.sqlite";
+my $dbdir = "/var/lib/wp";
+open my $runonce, '<', $0 or die "Unable to open self for reading $0 : $!";
+flock $runonce, LOCK_EX | LOCK_NB or exit;
+
+sub userdatascan {
+        open my $ud, '<', '/etc/userdatadomains' or die "Unable to open /etc/userdatadomains for reading : $!";
+        while (defined(my $line = <$ud>)) {
+                chomp $line;
+                my ($domain, $data) = split /: /, $line, 2;
+                my ($user, undef, undef, undef, $path) = split /==/, $data;
+                $suspended{$user} = (-f "/var/cpanel/suspended/$user" ? 1 : 0) unless exists $suspended{$user};
+                $domain2user{lc $domain} = $user;
+                $domain2path{lc $domain} = $path;
+        }
+        close $ud;
+}
+
+sub confighasdb {
+        my ($path, $db) = @_;
+        open my $f, '<', "$path/wp-config.php" or return;
+        my $user = getpwuid((stat($f))[4]);
+        while (defined(my $line = <$f>)) {
+                next unless $line =~ /define/ && $line =~ /DB_NAME/;
+                return $user if $line =~ /\b\Q$db\E\b/;
+        }
+        return;
+}
+
+sub tables {
+        my $dbh = DBI->connect("DBI:mysql:information_schema:mysql_read_default_file=/root/.my.cnf", 'root', undef,
+                { RaiseError => 1, PrintError => 1 });
+        my $res = $dbh->selectall_arrayref("SELECT TABLE_SCHEMA,TABLE_NAME FROM TABLES WHERE TABLE_NAME LIKE '%options'");
+        $dbh->disconnect;
+        return @$res
+}
+
+sub pluginversion {
+        my ($docroot, $path) = @_;
+        open my $f, '<', "$docroot/wp-content/plugins/$path" or return "?";
+        while (defined(my $line = <$f>)) {
+                next unless $line =~ /Version:\s*([\d.]+)/;
+                return $1;
+        }
+        return "?";
+}
+
+sub wp_version {
+        my ($docroot) = @_;
+        open my $f, '<', "$docroot/wp-includes/version.php" or return "?";
+        while (defined(my $line = <$f>)) {
+                next unless $line =~ /\$wp_version\D+([\d.]+)/;
+                return $1;
+        }
+        return "?";
+}
+
+sub cwd {
+        my ($db, $url) = @_;
+        die "what kind of siteurl is this? $url"
+                unless $url =~ m,^ https? :// ([^/]+) (/.*)? $,ix;
+        my ($domain, $subdir) = (lc $1, $2);
+        $subdir = "" unless defined $subdir;
+        die "suspicious siteurl: $url" if $subdir =~ /\.\./;
+        die "unknown domain in siteurl: $url" unless exists $domain2path{$domain};
+
+        my $path = $domain2path{$domain}.$subdir;
+        my $user = confighasdb($path, $db);
+        return ($path, $user) if defined $user;
+
+        $path = $domain2path{$domain};
+        $user = confighasdb($path, $db);
+        return ($path, $user) if defined $user;
+
+        die "siteurl has unknown docroot : $url";
+}
+
+sub wpscan {
+        my ($db, $tbl) = @_;
+        my $dbh;
+        eval {
+                $dbh = DBI->connect("DBI:mysql:$db;mysql_read_default_file=/root/.my.cnf",
+                        'root', undef,
+                        { RaiseError => 1, PrintError => 1 });
+        };
+        return if $@ || !$dbh;
+        my $qtbl = $dbh->quote_identifier($tbl);
+        my ($docroot, $user, @plugins, $siteurl, $theme);
+        eval {
+                my $res1 = $dbh->selectall_arrayref("select option_value from $qtbl where option_name='siteurl'");
+                ($docroot, $user) = cwd($db, $siteurl = $res1->[0][0]) if defined($res1) && @$res1 > 0;
+                my $res2 = $dbh->selectall_arrayref("select option_value from $qtbl where option_name='active_plugins'");
+                @plugins = $res2->[0][0] =~ m,"([\w. /-]+)",g if defined($res2) && @$res2 > 0;
+        };
+        if ($@) {
+                warn "gave up on $db $tbl : $@"
+        } elsif (defined($docroot) && defined($user) && defined($siteurl) && @plugins) {
+                eval {
+                        my $res = $dbh->selectall_arrayref("select option_value from $qtbl where option_name='current_theme'");
+                        $theme = $res->[0][0];
+                };
+                $theme = "" unless defined $theme;
+                my $wpver = wp_version($docroot);
+                for my $path (@plugins) {
+                        $wp{$db}{$tbl}{$user}{$siteurl}{$docroot}{$wpver}{$theme}{$path} = pluginversion($docroot, $path);
+                }
+        }
+        $dbh->disconnect;
+}
+
+sub update_sqlite {
+        my $plugins = 0;
+        system "mkdir", "-p", $dbdir unless -d $dbdir;
+        chmod 0600, $dbdir;
+        unlink "$dbfile.new";
+        my $dbh = DBI->connect("dbi:SQLite:dbname=$dbfile.new", undef, undef, { RaiseError => 1 });
+        $dbh->do(<<'SQL');
+CREATE TABLE plugins (
+        host TEXT NOT NULL,
+        db TEXT NOT NULL,
+        tbl TEXT NOT NULL,
+        user TEXT NOT NULL,
+        siteurl TEXT NOT NULL,
+        root TEXT NOT NULL,
+        wpver TEXT NOT NULL,
+        ppath TEXT NOT NULL,
+        plugin TEXT NOT NULL,
+        pver TEXT NOT NULL,
+        suspended INT NOT NULL,
+        theme TEXT NOT NULL
+);
+SQL
+        $dbh->do('CREATE INDEX idx_plugin on plugins(plugin)');
+        $dbh->do('BEGIN TRANSACTION');
+        for my $db (keys %wp) {
+                for my $tbl (keys %{$wp{$db}}) {
+                        for my $user (keys %{$wp{$db}{$tbl}}) {
+                                for my $siteurl (keys %{$wp{$db}{$tbl}{$user}}) {
+                                        for my $docroot (keys %{$wp{$db}{$tbl}{$user}{$siteurl}}) {
+                                                for my $wpver (keys %{$wp{$db}{$tbl}{$user}{$siteurl}{$docroot}}) {
+                                                        for my $theme (keys %{$wp{$db}{$tbl}{$user}{$siteurl}{$docroot}{$wpver}}) {
+                                                                for my $path (keys %{$wp{$db}{$tbl}{$user}{$siteurl}{$docroot}{$wpver}{$theme}}) {
+                                                                        my $vsn = $wp{$db}{$tbl}{$user}{$siteurl}{$docroot}{$wpver}{$theme}{$path};
+                                                                        (my $plugin = $path) =~ s,/.*,,;
+                                                                        $dbh->do('INSERT INTO plugins VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', {}, $hostname, $db, $tbl, $user, $siteurl, $docroot, $wpver, $path, $plugin, $vsn, $suspended{$user} || 0, $theme);
+                                                                        $plugins++;
+                                                                }
+                                                        }
+                                                }
+                                        }
+                                }
+                        }
+                }
+        }
+        $dbh->do('COMMIT');
+        $dbh->disconnect();
+        if ($plugins) {
+                rename "$dbfile.new" => $dbfile;
+                chmod 0640, $dbfile;
+        } else {
+                unlink "$dbfile.new";
+        }
+}
+
+open STDERR, '>', '/dev/null' unless -t \*STDIN;
+userdatascan();
+wpscan(@$_) for tables();
+update_sqlite();
